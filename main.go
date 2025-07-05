@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bufio"
+	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/list"
@@ -62,16 +65,20 @@ type cleanProgressMsg struct {
 
 // Model represents the application state
 type Model struct {
-	state       state
-	list        list.Model
-	items       []CleanableItem
-	spinner     spinner.Model
-	progress    progress.Model
-	cleaning    bool
-	totalSize   int64
-	cleanedSize int64
-	currentDir  string
-	err         error
+	state         state
+	list          list.Model
+	items         []CleanableItem
+	spinner       spinner.Model
+	progress      progress.Model
+	cleaning      bool
+	totalSize     int64
+	cleanedSize   int64
+	currentDir    string
+	useGitignore  bool
+	scanStartTime time.Time
+	scanDuration  time.Duration
+	scannedItems  int
+	err           error
 }
 
 // Key mappings
@@ -121,7 +128,7 @@ var (
 			Bold(true)
 )
 
-func initialModel(targetDir string) Model {
+func initialModel(targetDir string, useGitignore bool) Model {
 	// Initialize spinner
 	s := spinner.New()
 	s.Spinner = spinner.Dot
@@ -138,19 +145,22 @@ func initialModel(targetDir string) Model {
 	l.Styles.Title = titleStyle
 
 	return Model{
-		state:      stateScanning,
-		list:       l,
-		items:      []CleanableItem{},
-		spinner:    s,
-		progress:   prog,
-		currentDir: targetDir,
+		state:         stateScanning,
+		list:          l,
+		items:         []CleanableItem{},
+		spinner:       s,
+		progress:      prog,
+		currentDir:    targetDir,
+		useGitignore:  useGitignore,
+		scanStartTime: time.Now(),
+		scannedItems:  0,
 	}
 }
 
 func (m Model) Init() tea.Cmd {
 	return tea.Batch(
 		m.spinner.Tick,
-		scanForCleanableItems(m.currentDir),
+		scanForCleanableItems(m.currentDir, m.useGitignore),
 	)
 }
 
@@ -172,9 +182,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case key.Matches(msg, keys.quit):
 				return m, tea.Quit
 			case key.Matches(msg, keys.toggle):
-				return m.toggleSelection(), nil
+				if !m.cleaning {
+					return m.toggleSelection(), nil
+				}
 			case key.Matches(msg, keys.clean):
-				return m.startCleaning()
+				if !m.cleaning {
+					return m.startCleaning()
+				}
 			}
 		case stateCleaning:
 			if key.Matches(msg, keys.quit) {
@@ -188,6 +202,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case scanCompleteMsg:
 		m.items = []CleanableItem(msg)
+		m.scannedItems = len(m.items)
+		m.scanDuration = time.Since(m.scanStartTime)
 		m.state = stateSelecting
 
 		// Convert items to list items
@@ -203,9 +219,62 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmd := m.progress.SetPercent(float64(msg.done) / float64(msg.total))
 		return m, cmd
 
+	case cleanSingleItem:
+		if msg.index >= len(msg.items) {
+			return m, func() tea.Msg { return cleanCompleteMsg{} }
+		}
+
+		item := msg.items[msg.index]
+
+		// Clean the item and update cleaned size
+		if err := os.RemoveAll(item.Path); err == nil {
+			m.cleanedSize += item.Size
+
+			// Remove the cleaned item from the model's items list
+			for i, modelItem := range m.items {
+				if modelItem.Path == item.Path {
+					m.items = append(m.items[:i], m.items[i+1:]...)
+					break
+				}
+			}
+
+			// Update the list display
+			listItems := make([]list.Item, len(m.items))
+			for i, modelItem := range m.items {
+				listItems[i] = modelItem
+			}
+			m.list.SetItems(listItems)
+		}
+
+		// Send progress update
+		progressCmd := func() tea.Msg {
+			return cleanProgressMsg{
+				item:  item.Path,
+				done:  msg.index + 1,
+				total: msg.total,
+			}
+		}
+
+		// Continue with next item or complete
+		var nextCmd tea.Cmd
+		if msg.index+1 < len(msg.items) {
+			nextCmd = tea.Tick(time.Millisecond*100, func(time.Time) tea.Msg {
+				return cleanSingleItem{
+					items: msg.items,
+					index: msg.index + 1,
+					total: msg.total,
+				}
+			})
+		} else {
+			nextCmd = func() tea.Msg { return cleanCompleteMsg{} }
+		}
+
+		return m, tea.Batch(progressCmd, nextCmd)
+
 	case cleanCompleteMsg:
-		m.state = stateComplete
+		m.state = stateSelecting
 		m.cleaning = false
+		m.scannedItems = len(m.items) // Update total items count
 		return m, nil
 
 	case spinner.TickMsg:
@@ -229,10 +298,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m Model) View() string {
 	switch m.state {
 	case stateScanning:
+		elapsed := time.Since(m.scanStartTime)
 		return docStyle.Render(fmt.Sprintf(
-			"%s Scanning for cleanable items...\n\nDirectory: %s",
+			"%s Scanning for cleanable items...\n\nDirectory: %s\nElapsed: %v\nItems found: %d",
 			m.spinner.View(),
 			m.currentDir,
+			elapsed.Round(time.Millisecond),
+			m.scannedItems,
 		))
 
 	case stateSelecting:
@@ -246,12 +318,23 @@ func (m Model) View() string {
 		selectedCount := m.countSelectedItems()
 
 		status := fmt.Sprintf(
-			"\nSelected: %d items (%s)",
+			"\nScan time: %v (%d items) | Selected: %d items (%s)",
+			m.scanDuration.Round(time.Millisecond),
+			m.scannedItems,
 			selectedCount,
 			formatSize(totalSize),
 		)
 
-		return docStyle.Render(m.list.View() + status + help)
+		content := m.list.View() + status
+
+		// Show progress bar if cleaning
+		if m.cleaning {
+			content += "\n\nCleaning in progress...\n" + m.progress.View()
+		}
+
+		content += help
+
+		return docStyle.Render(content)
 
 	case stateCleaning:
 		return docStyle.Render(fmt.Sprintf(
@@ -296,7 +379,6 @@ func (m Model) startCleaning() (Model, tea.Cmd) {
 		return m, nil
 	}
 
-	m.state = stateCleaning
 	m.cleaning = true
 
 	return m, cleanSelectedItems(m.items)
@@ -323,52 +405,67 @@ func (m Model) countSelectedItems() int {
 }
 
 // Commands
-func scanForCleanableItems(dir string) tea.Cmd {
+func scanForCleanableItems(dir string, useGitignore bool) tea.Cmd {
 	return func() tea.Msg {
 		var items []CleanableItem
 
-		// Define patterns to look for
-		patterns := map[string]string{
-			"node_modules":        "Node.js dependencies",
-			"target":              "Rust build artifacts",
-			"build":               "Build artifacts",
-			"dist":                "Distribution files",
-			"__pycache__":         "Python cache",
-			".pytest_cache":       "Pytest cache",
-			"venv":                "Python virtual environment",
-			"env":                 "Python virtual environment",
-			".venv":               "Python virtual environment",
-			"vendor":              "Vendor dependencies",
-			"deps":                "Elixir dependencies",
-			"_build":              "Elixir build artifacts",
-			".gradle":             "Gradle cache",
-			"cmake-build-debug":   "CMake build artifacts",
-			"cmake-build-release": "CMake build artifacts",
-			"DerivedData":         "Xcode derived data",
-			"*.log":               "Log files",
-			"*.tmp":               "Temporary files",
-		}
-
-		// Walk through directory tree
-		err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-			if err != nil {
-				return nil // Skip errors, continue walking
+		if useGitignore {
+			// Scan .gitignore file for patterns
+			gitignoreItems := scanGitignoreItems(dir)
+			items = append(items, gitignoreItems...)
+		} else {
+			// Define patterns to look for
+			patterns := map[string]string{
+				"node_modules":        "Node.js dependencies",
+				"target":              "Rust build artifacts",
+				"build":               "Build artifacts",
+				"dist":                "Distribution files",
+				"__pycache__":         "Python cache",
+				".pytest_cache":       "Pytest cache",
+				"venv":                "Python virtual environment",
+				"env":                 "Python virtual environment",
+				".venv":               "Python virtual environment",
+				"vendor":              "Vendor dependencies",
+				"deps":                "Elixir dependencies",
+				"_build":              "Elixir build artifacts",
+				".gradle":             "Gradle cache",
+				"cmake-build-debug":   "CMake build artifacts",
+				"cmake-build-release": "CMake build artifacts",
+				"DerivedData":         "Xcode derived data",
+				"*.log":               "Log files",
+				"*.tmp":               "Temporary files",
 			}
 
-			// Skip hidden directories and files at root level
-			if strings.HasPrefix(filepath.Base(path), ".") && path != dir {
-				if info.IsDir() {
-					return filepath.SkipDir
+			// Walk through directory tree
+			err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+				if err != nil {
+					return nil // Skip errors, continue walking
 				}
-				return nil
-			}
 
-			// Check if this matches any of our patterns
-			basename := filepath.Base(path)
-			for pattern, description := range patterns {
-				if strings.Contains(pattern, "*") {
-					// Handle glob patterns
-					if matched, _ := filepath.Match(pattern, basename); matched {
+				// Skip hidden directories and files at root level
+				if strings.HasPrefix(filepath.Base(path), ".") && path != dir {
+					if info.IsDir() {
+						return filepath.SkipDir
+					}
+					return nil
+				}
+
+				// Check if this matches any of our patterns
+				basename := filepath.Base(path)
+				for pattern, description := range patterns {
+					if strings.Contains(pattern, "*") {
+						// Handle glob patterns
+						if matched, _ := filepath.Match(pattern, basename); matched {
+							size := getDirectorySize(path)
+							items = append(items, CleanableItem{
+								Path:     path,
+								Type:     description,
+								Size:     size,
+								Info:     description,
+								Selected: false,
+							})
+						}
+					} else if basename == pattern {
 						size := getDirectorySize(path)
 						items = append(items, CleanableItem{
 							Path:     path,
@@ -377,29 +474,20 @@ func scanForCleanableItems(dir string) tea.Cmd {
 							Info:     description,
 							Selected: false,
 						})
-					}
-				} else if basename == pattern {
-					size := getDirectorySize(path)
-					items = append(items, CleanableItem{
-						Path:     path,
-						Type:     description,
-						Size:     size,
-						Info:     description,
-						Selected: false,
-					})
 
-					// If it's a directory, skip walking into it
-					if info.IsDir() {
-						return filepath.SkipDir
+						// If it's a directory, skip walking into it
+						if info.IsDir() {
+							return filepath.SkipDir
+						}
 					}
 				}
+
+				return nil
+			})
+
+			if err != nil {
+				return scanCompleteMsg([]CleanableItem{})
 			}
-
-			return nil
-		})
-
-		if err != nil {
-			return scanCompleteMsg([]CleanableItem{})
 		}
 
 		return scanCompleteMsg(items)
@@ -407,33 +495,140 @@ func scanForCleanableItems(dir string) tea.Cmd {
 }
 
 func cleanSelectedItems(items []CleanableItem) tea.Cmd {
-	return func() tea.Msg {
-		var totalCleaned int64
-		selectedItems := []CleanableItem{}
+	return tea.Batch(startCleaningProcess(items))
+}
 
-		// Get selected items
+func startCleaningProcess(items []CleanableItem) tea.Cmd {
+	return func() tea.Msg {
+		selectedItems := []CleanableItem{}
 		for _, item := range items {
 			if item.Selected {
 				selectedItems = append(selectedItems, item)
 			}
 		}
 
-		// Clean each selected item
-		for i, item := range selectedItems {
-			if err := os.RemoveAll(item.Path); err == nil {
-				totalCleaned += item.Size
-			}
-
-			// Send progress update
-			tea.NewProgram(nil).Send(cleanProgressMsg{
-				item:  item.Path,
-				done:  i + 1,
-				total: len(selectedItems),
-			})
+		if len(selectedItems) == 0 {
+			return cleanCompleteMsg{}
 		}
 
-		return cleanCompleteMsg{}
+		// Start with first item
+		return cleanSingleItem{
+			items: selectedItems,
+			index: 0,
+			total: len(selectedItems),
+		}
 	}
+}
+
+// New message type for cleaning single items
+type cleanSingleItem struct {
+	items []CleanableItem
+	index int
+	total int
+}
+
+func scanGitignoreItems(dir string) []CleanableItem {
+	var items []CleanableItem
+	gitignorePath := filepath.Join(dir, ".gitignore")
+
+	// Check if .gitignore exists
+	if _, err := os.Stat(gitignorePath); os.IsNotExist(err) {
+		return items
+	}
+
+	// Read .gitignore file
+	file, err := os.Open(gitignorePath)
+	if err != nil {
+		return items
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+
+		// Skip empty lines and comments
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// Skip negation patterns for now
+		if strings.HasPrefix(line, "!") {
+			continue
+		}
+
+		// Walk through directory to find matches
+		err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return nil
+			}
+
+			// Skip the .git directory itself
+			if strings.Contains(path, "/.git/") || strings.HasSuffix(path, "/.git") {
+				return filepath.SkipDir
+			}
+
+			// Get relative path from directory
+			relPath, err := filepath.Rel(dir, path)
+			if err != nil {
+				return nil
+			}
+
+			// Check if path matches gitignore pattern
+			if matchesGitignorePattern(line, relPath) {
+				// Avoid duplicates
+				for _, existing := range items {
+					if existing.Path == path {
+						return nil
+					}
+				}
+
+				size := getDirectorySize(path)
+				items = append(items, CleanableItem{
+					Path:     path,
+					Type:     "Gitignore pattern: " + line,
+					Size:     size,
+					Info:     "Matches .gitignore pattern",
+					Selected: false,
+				})
+
+				// If it's a directory, skip walking into it
+				if info.IsDir() {
+					return filepath.SkipDir
+				}
+			}
+
+			return nil
+		})
+
+		if err != nil {
+			continue
+		}
+	}
+
+	return items
+}
+
+func matchesGitignorePattern(pattern, path string) bool {
+	// Handle directory patterns
+	if strings.HasSuffix(pattern, "/") {
+		pattern = strings.TrimSuffix(pattern, "/")
+		return strings.HasPrefix(path, pattern+"/") || path == pattern
+	}
+
+	// Handle glob patterns
+	if strings.Contains(pattern, "*") {
+		matched, _ := filepath.Match(pattern, filepath.Base(path))
+		if matched {
+			return true
+		}
+		// Also try matching the full relative path
+		matched, _ = filepath.Match(pattern, path)
+		return matched
+	}
+
+	// Exact match or path contains pattern
+	return path == pattern || strings.Contains(path, pattern) || strings.HasSuffix(path, "/"+pattern)
 }
 
 // Helper functions
@@ -471,10 +666,15 @@ func formatSize(bytes int64) string {
 }
 
 func main() {
-	// Get target directory from command line args or use current directory
+	// Define command line flags
+	var gitignoreFlag = flag.Bool("gitignore", false, "scan files matching .gitignore patterns")
+	flag.Parse()
+
+	// Get target directory from remaining args or use current directory
 	targetDir := "."
-	if len(os.Args) > 1 {
-		targetDir = os.Args[1]
+	args := flag.Args()
+	if len(args) > 0 {
+		targetDir = args[0]
 
 		// Verify the directory exists
 		if info, err := os.Stat(targetDir); err != nil {
@@ -494,7 +694,15 @@ func main() {
 		}
 	}
 
-	model := initialModel(targetDir)
+	// Check if gitignore flag is used but .gitignore doesn't exist
+	if *gitignoreFlag {
+		gitignorePath := filepath.Join(targetDir, ".gitignore")
+		if _, err := os.Stat(gitignorePath); os.IsNotExist(err) {
+			log.Fatalf("Error: .gitignore file not found in directory '%s'", targetDir)
+		}
+	}
+
+	model := initialModel(targetDir, *gitignoreFlag)
 	p := tea.NewProgram(model, tea.WithAltScreen())
 
 	if _, err := p.Run(); err != nil {

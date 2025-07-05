@@ -4,6 +4,7 @@ A terminal UI app to clean up development dependencies and build artifacts.
 
 ## What it cleans
 
+### Default mode
 - `node_modules` (Node.js)
 - `target` (Rust)
 - `__pycache__`, `venv` (Python)
@@ -11,6 +12,10 @@ A terminal UI app to clean up development dependencies and build artifacts.
 - `.gradle` (Java)
 - `deps`, `_build` (Elixir)
 - Log files, temp files, and more
+
+### Gitignore mode (`--gitignore`)
+- Files and directories matching patterns in `.gitignore`
+- Requires a `.gitignore` file in the target directory
 
 ## Install
 
@@ -26,6 +31,12 @@ devtidy
 
 # Scan specific directory
 devtidy /path/to/project
+
+# Scan files matching .gitignore patterns
+devtidy --gitignore
+
+# Scan specific directory with gitignore patterns
+devtidy --gitignore /path/to/project
 ```
 
 ## Controls
