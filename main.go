@@ -2,9 +2,7 @@ package main
 
 import (
 	"fmt"
-	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -14,6 +12,7 @@ import (
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/log"
 )
 
 // CleanableItem represents a directory or file that can be cleaned
@@ -472,11 +471,6 @@ func formatSize(bytes int64) string {
 }
 
 func main() {
-	// Check if bubbletea dependencies are available
-	if _, err := exec.LookPath("go"); err != nil {
-		log.Fatal("Go is required to run this application")
-	}
-
 	// Get target directory from command line args or use current directory
 	targetDir := "."
 	if len(os.Args) > 1 {
