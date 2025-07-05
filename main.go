@@ -25,8 +25,21 @@ type CleanableItem struct {
 	Selected bool
 }
 
-func (i CleanableItem) Title() string       { return i.Path }
-func (i CleanableItem) Description() string { return fmt.Sprintf("%s - %s", i.Type, formatSize(i.Size)) }
+func (i CleanableItem) Title() string {
+	if i.Selected {
+		return selectedStyle.Render("✓ " + i.Path)
+	}
+	return i.Path
+}
+
+func (i CleanableItem) Description() string {
+	desc := fmt.Sprintf("%s - %s", i.Type, formatSize(i.Size))
+	if i.Selected {
+		return selectedStyle.Render(desc)
+	}
+	return desc
+}
+
 func (i CleanableItem) FilterValue() string { return i.Path }
 
 // Define the different states of the app
@@ -43,8 +56,8 @@ const (
 type scanCompleteMsg []CleanableItem
 type cleanCompleteMsg struct{}
 type cleanProgressMsg struct {
-	item string
-	done int
+	item  string
+	done  int
 	total int
 }
 
@@ -92,21 +105,21 @@ var (
 	docStyle = lipgloss.NewStyle().Margin(1, 2)
 
 	titleStyle = lipgloss.NewStyle().
-		Background(lipgloss.Color("62")).
-		Foreground(lipgloss.Color("230")).
-		Padding(0, 1)
+			Background(lipgloss.Color("62")).
+			Foreground(lipgloss.Color("230")).
+			Padding(0, 1)
 
 	selectedStyle = lipgloss.NewStyle().
-		Foreground(lipgloss.Color("170")).
-		Bold(true)
+			Foreground(lipgloss.Color("42")).
+			Bold(true)
 
 	errorStyle = lipgloss.NewStyle().
-		Foreground(lipgloss.Color("196")).
-		Bold(true)
+			Foreground(lipgloss.Color("196")).
+			Bold(true)
 
 	successStyle = lipgloss.NewStyle().
-		Foreground(lipgloss.Color("42")).
-		Bold(true)
+			Foreground(lipgloss.Color("42")).
+			Bold(true)
 )
 
 func initialModel(targetDir string) Model {
@@ -225,7 +238,7 @@ func (m Model) View() string {
 
 	case stateSelecting:
 		help := "\nControls:\n" +
-			"  space: toggle selection\n" +
+			"  space: toggle selection (✓ = selected)\n" +
 			"  c: clean selected items\n" +
 			"  q: quit\n" +
 			"  /: filter items"
@@ -317,24 +330,24 @@ func scanForCleanableItems(dir string) tea.Cmd {
 
 		// Define patterns to look for
 		patterns := map[string]string{
-			"node_modules":     "Node.js dependencies",
-			"target":           "Rust build artifacts",
-			"build":            "Build artifacts",
-			"dist":             "Distribution files",
-			"__pycache__":      "Python cache",
-			".pytest_cache":    "Pytest cache",
-			"venv":             "Python virtual environment",
-			"env":              "Python virtual environment",
-			".venv":            "Python virtual environment",
-			"vendor":           "Vendor dependencies",
-			"deps":             "Elixir dependencies",
-			"_build":           "Elixir build artifacts",
-			".gradle":          "Gradle cache",
-			"cmake-build-debug": "CMake build artifacts",
+			"node_modules":        "Node.js dependencies",
+			"target":              "Rust build artifacts",
+			"build":               "Build artifacts",
+			"dist":                "Distribution files",
+			"__pycache__":         "Python cache",
+			".pytest_cache":       "Pytest cache",
+			"venv":                "Python virtual environment",
+			"env":                 "Python virtual environment",
+			".venv":               "Python virtual environment",
+			"vendor":              "Vendor dependencies",
+			"deps":                "Elixir dependencies",
+			"_build":              "Elixir build artifacts",
+			".gradle":             "Gradle cache",
+			"cmake-build-debug":   "CMake build artifacts",
 			"cmake-build-release": "CMake build artifacts",
-			"DerivedData":      "Xcode derived data",
-			"*.log":            "Log files",
-			"*.tmp":            "Temporary files",
+			"DerivedData":         "Xcode derived data",
+			"*.log":               "Log files",
+			"*.tmp":               "Temporary files",
 		}
 
 		// Walk through directory tree
