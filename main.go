@@ -574,9 +574,7 @@ func scanGitignoreItems(dir string) []CleanableItem {
 				return nil
 			}
 
-			// Check if path matches gitignore pattern
 			if matchesGitignorePattern(line, relPath) {
-				// Avoid duplicates
 				for _, existing := range items {
 					if existing.Path == path {
 						return nil
