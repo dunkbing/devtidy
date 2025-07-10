@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -663,10 +664,62 @@ func formatSize(bytes int64) string {
 	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
 
+const version = "v1.0.0"
+
+func showVersion() {
+	fmt.Printf("devtidy %s\n", version)
+	fmt.Printf("Built with Go %s (%s/%s)\n", runtime.Version(), runtime.GOOS, runtime.GOARCH)
+}
+
+func showHelp() {
+	fmt.Printf("devtidy %s - Clean development artifacts from your projects\n\n", version)
+	fmt.Println("USAGE:")
+	fmt.Println("  devtidy [options] [directory]")
+	fmt.Println()
+	fmt.Println("OPTIONS:")
+	fmt.Println("  -h, --help      Show this help message")
+	fmt.Println("  -v, --version   Show version information")
+	fmt.Println("  --gitignore     Scan files matching .gitignore patterns")
+	fmt.Println()
+	fmt.Println("ARGUMENTS:")
+	fmt.Println("  directory       Target directory to scan (default: current directory)")
+	fmt.Println()
+	fmt.Println("DESCRIPTION:")
+	fmt.Println("  DevTidy helps you clean up common development artifacts like:")
+	fmt.Println("  • node_modules (Node.js dependencies)")
+	fmt.Println("  • target (Rust build artifacts)")
+	fmt.Println("  • __pycache__ (Python cache files)")
+	fmt.Println("  • build/dist (Build and distribution files)")
+	fmt.Println("  • .gradle (Gradle cache)")
+	fmt.Println("  • And many more...")
+	fmt.Println()
+	fmt.Println("EXAMPLES:")
+	fmt.Println("  devtidy                    # Scan current directory")
+	fmt.Println("  devtidy /path/to/project   # Scan specific directory")
+	fmt.Println("  devtidy --gitignore        # Scan using .gitignore patterns")
+	fmt.Println()
+}
+
 func main() {
 	// Define command line flags
 	var gitignoreFlag = flag.Bool("gitignore", false, "scan files matching .gitignore patterns")
+	var helpFlag = flag.Bool("h", false, "show help")
+	var help2Flag = flag.Bool("help", false, "show help")
+	var versionFlag = flag.Bool("v", false, "show version")
+	var version2Flag = flag.Bool("version", false, "show version")
 	flag.Parse()
+
+	// Handle help flag
+	if *helpFlag || *help2Flag {
+		showHelp()
+		return
+	}
+
+	// Handle version flag
+	if *versionFlag || *version2Flag {
+		showVersion()
+		return
+	}
 
 	// Get target directory from remaining args or use current directory
 	targetDir := "."
