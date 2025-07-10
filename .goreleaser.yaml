@@ -50,3 +50,13 @@ release:
   name_template: "Release {{ .Tag }}"
   draft: false
   prerelease: auto
+
+brews:
+  - repository:
+      owner: dunkbing
+      name: homebrew-brews
+    directory: Formula
+    homepage: https://github.com/dunkbing/devtidy
+    description: A terminal UI app to clean up development dependencies and build artifacts.
+    test: |
+      system "#{bin}/devtidy --help"
