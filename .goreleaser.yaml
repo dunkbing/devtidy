@@ -52,9 +52,9 @@ release:
   prerelease: auto
 
 homebrew_casks:
-  - repository:
+  - name: devtidy
+    repository:
       owner: dunkbing
       name: homebrew-brews
-    directory: Formula
     homepage: https://github.com/dunkbing/devtidy
     description: A terminal UI app to clean up development dependencies and build artifacts.
