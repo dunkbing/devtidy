@@ -19,6 +19,12 @@ A terminal UI app to clean up development dependencies and build artifacts.
 
 ## Install
 
+### Homebrew (macOS/Linux)
+```bash
+brew install --cask dunkbing/brews/devtidy
+```
+
+### Go install
 ```bash
 go install github.com/dunkbing/devtidy@latest
 ```
@@ -30,13 +36,7 @@ go install github.com/dunkbing/devtidy@latest
 devtidy
 
 # Scan specific directory
-devtidy /path/to/project
-
-# Scan files matching .gitignore patterns
-devtidy --gitignore
-
-# Scan specific directory with gitignore patterns
-devtidy --gitignore /path/to/project
+devtidy /path/to/dir
 ```
 
 ## Controls
