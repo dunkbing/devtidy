@@ -664,7 +664,7 @@ func formatSize(bytes int64) string {
 	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
 
-const version = "v1.0.3"
+const version = "v1.0.4"
 
 func showVersion() {
 	fmt.Printf("devtidy %s\n", version)

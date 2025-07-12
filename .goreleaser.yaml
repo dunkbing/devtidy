@@ -58,3 +58,9 @@ homebrew_casks:
       name: homebrew-brews
     homepage: https://github.com/dunkbing/devtidy
     description: A terminal UI app to clean up development dependencies and build artifacts.
+    hooks:
+        post:
+          install: |
+            if system_command("/usr/bin/xattr", args: ["-h"]).exit_status == 0
+              system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/devtidy"]
+            end
