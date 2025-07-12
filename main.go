@@ -7,9 +7,9 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/charmbracelet/bubbles/key"
@@ -402,8 +402,8 @@ func (m Model) countSelectedItems() int {
 }
 
 type scanJob struct {
-	root   string
-	info   os.FileInfo
+	root string
+	info os.FileInfo
 }
 
 func boundedWalk(root string, maxWorkers int) <-chan scanJob {
@@ -451,9 +451,27 @@ func boundedWalk(root string, maxWorkers int) <-chan scanJob {
 					info, _ := e.Info()
 					out <- scanJob{root: path, info: info}
 
-					mu.Lock()
-					work = append(work, path)
-					mu.Unlock()
+					// Check if this directory matches a cleanable pattern
+					shouldSkip := false
+					for pat := range cleanablePatterns {
+						var match bool
+						if strings.Contains(pat, "*") {
+							match, _ = filepath.Match(pat, name)
+						} else {
+							match = name == pat
+						}
+						if match {
+							shouldSkip = true
+							break
+						}
+					}
+
+					// Only add to work queue if we shouldn't skip this directory
+					if !shouldSkip {
+						mu.Lock()
+						work = append(work, path)
+						mu.Unlock()
+					}
 				}
 			}
 		}
@@ -477,70 +495,71 @@ func scanForCleanableItems(dir string, useGitignore bool) tea.Cmd {
 		if useGitignore {
 			gitignoreItems := scanGitignoreItems(dir)
 			items = append(items, gitignoreItems...)
+			sort.Slice(items, func(i, j int) bool {
+				return items[i].Size > items[j].Size
+			})
 			return scanCompleteMsg(items)
-		}
-
-		patterns := map[string]string{
-			"node_modules":        "Node.js dependencies",
-			"target":              "Rust build artifacts",
-			"build":               "Build artifacts",
-			"dist":                "Distribution files",
-			"__pycache__":         "Python cache",
-			".pytest_cache":       "Pytest cache",
-			"venv":                "Python virtual environment",
-			"env":                 "Python virtual environment",
-			".venv":               "Python virtual environment",
-			"vendor":              "Vendor dependencies",
-			"deps":                "Elixir dependencies",
-			"_build":              "Elixir build artifacts",
-			".gradle":             "Gradle cache",
-			"cmake-build-debug":   "CMake build artifacts",
-			"cmake-build-release": "CMake build artifacts",
-			"DerivedData":         "Xcode derived data",
-			"*.log":               "Log files",
-			"*.tmp":               "Temporary files",
 		}
 
 		sizeCache := make(map[string]int64)
 		var cacheMu sync.Mutex
 		var wg sync.WaitGroup
 
-		for j := range boundedWalk(dir, runtime.NumCPU()) {
-			j := j
+		maxWorkers := runtime.NumCPU() / 2
+		if maxWorkers < 2 {
+			maxWorkers = 2
+		}
+		jobChan := make(chan scanJob, maxWorkers*2)
+
+		// Start workers
+		for i := 0; i < maxWorkers; i++ {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				name := filepath.Base(j.root)
-				for pat, desc := range patterns {
-					var match bool
-					if strings.Contains(pat, "*") {
-						match, _ = filepath.Match(pat, name)
-					} else {
-						match = name == pat
-					}
-					if match {
-						cacheMu.Lock()
-						if _, ok := sizeCache[j.root]; !ok {
-							sizeCache[j.root] = getDirectorySize(j.root)
+				for j := range jobChan {
+					name := filepath.Base(j.root)
+					for pat, desc := range cleanablePatterns {
+						var match bool
+						if strings.Contains(pat, "*") {
+							match, _ = filepath.Match(pat, name)
+						} else {
+							match = name == pat
 						}
-						sz := sizeCache[j.root]
-						cacheMu.Unlock()
+						if match {
+							cacheMu.Lock()
+							if _, ok := sizeCache[j.root]; !ok {
+								sizeCache[j.root] = getDirectorySize(j.root)
+							}
+							sz := sizeCache[j.root]
+							cacheMu.Unlock()
 
-						mx.Lock()
-						items = append(items, CleanableItem{
-							Path:     j.root,
-							Type:     desc,
-							Size:     sz,
-							Info:     desc,
-							Selected: false,
-						})
-						mx.Unlock()
-						return
+							mx.Lock()
+							items = append(items, CleanableItem{
+								Path:     j.root,
+								Type:     desc,
+								Size:     sz,
+								Info:     desc,
+								Selected: false,
+							})
+							mx.Unlock()
+							break
+						}
 					}
 				}
 			}()
 		}
+
+		go func() {
+			defer close(jobChan)
+			for j := range boundedWalk(dir, runtime.NumCPU()/2) {
+				jobChan <- j
+			}
+		}()
+
 		wg.Wait()
+		sort.Slice(items, func(i, j int) bool {
+			return items[i].Size > items[j].Size
+		})
 		return scanCompleteMsg(items)
 	}
 }
@@ -605,7 +624,7 @@ func scanGitignoreItems(dir string) []CleanableItem {
 		mu    sync.Mutex
 	)
 
-	for job := range boundedWalk(dir, runtime.NumCPU()) {
+	for job := range boundedWalk(dir, runtime.NumCPU()/2) {
 		path := job.root
 		rel, _ := filepath.Rel(dir, path)
 		for _, pat := range patterns {
@@ -633,6 +652,9 @@ func scanGitignoreItems(dir string) []CleanableItem {
 			}
 		}
 	}
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].Size > items[j].Size
+	})
 	return items
 }
 
@@ -657,26 +679,16 @@ func matchesGitignorePattern(pattern, path string) bool {
 
 func getDirectorySize(path string) int64 {
 	var size int64
-	var wg sync.WaitGroup
-	limit := make(chan struct{}, runtime.NumCPU())
-
-	filepath.WalkDir(path, func(p string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
-			return nil
-		}
-		limit <- struct{}{}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			defer func() { <-limit }()
-			if fi, err := d.Info(); err == nil {
-				atomic.AddInt64(&size, fi.Size())
-			}
-		}()
-		return nil
-	})
-	wg.Wait()
-	return size
+    filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
+        if err != nil {
+            return err
+        }
+        if !info.IsDir() {
+            size += info.Size()
+        }
+        return err
+    })
+    return size
 }
 
 func formatSize(bytes int64) string {
@@ -693,6 +705,27 @@ func formatSize(bytes int64) string {
 }
 
 const version = "v1.0.4"
+
+var cleanablePatterns = map[string]string{
+	"node_modules":        "Node.js dependencies",
+	"target":              "Rust build artifacts",
+	"build":               "Build artifacts",
+	"dist":                "Distribution files",
+	"__pycache__":         "Python cache",
+	".pytest_cache":       "Pytest cache",
+	"venv":                "Python virtual environment",
+	"env":                 "Python virtual environment",
+	".venv":               "Python virtual environment",
+	"vendor":              "Vendor dependencies",
+	"deps":                "Elixir dependencies",
+	"_build":              "Elixir build artifacts",
+	".gradle":             "Gradle cache",
+	"cmake-build-debug":   "CMake build artifacts",
+	"cmake-build-release": "CMake build artifacts",
+	"DerivedData":         "Xcode derived data",
+	"*.log":               "Log files",
+	"*.tmp":               "Temporary files",
+}
 
 func showVersion() {
 	fmt.Printf("devtidy %s\n", version)
