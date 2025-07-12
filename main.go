@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/charmbracelet/bubbles/key"
@@ -19,7 +21,6 @@ import (
 	"github.com/charmbracelet/log"
 )
 
-// CleanableItem represents a directory or file that can be cleaned
 type CleanableItem struct {
 	Path     string
 	Type     string
@@ -45,7 +46,6 @@ func (i CleanableItem) Description() string {
 
 func (i CleanableItem) FilterValue() string { return i.Path }
 
-// Define the different states of the app
 type state int
 
 const (
@@ -55,7 +55,6 @@ const (
 	stateComplete
 )
 
-// Messages for the tea program
 type scanCompleteMsg []CleanableItem
 type cleanCompleteMsg struct{}
 type cleanProgressMsg struct {
@@ -130,15 +129,12 @@ var (
 )
 
 func initialModel(targetDir string, useGitignore bool) Model {
-	// Initialize spinner
 	s := spinner.New()
 	s.Spinner = spinner.Dot
 	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
 
-	// Initialize progress bar
 	prog := progress.New(progress.WithDefaultGradient())
 
-	// Initialize list
 	l := list.New([]list.Item{}, list.NewDefaultDelegate(), 0, 0)
 	l.Title = "Cleanable Items"
 	l.SetShowStatusBar(false)
@@ -405,92 +401,146 @@ func (m Model) countSelectedItems() int {
 	return count
 }
 
+type scanJob struct {
+	root   string
+	info   os.FileInfo
+}
+
+func boundedWalk(root string, maxWorkers int) <-chan scanJob {
+	if maxWorkers <= 0 {
+		maxWorkers = runtime.NumCPU()
+	}
+
+	out := make(chan scanJob, maxWorkers*2)
+	go func() {
+		defer close(out)
+
+		// work queue
+		work := []string{root}
+		var mu sync.Mutex
+		var wg sync.WaitGroup
+
+		// worker function
+		worker := func() {
+			defer wg.Done()
+			for {
+				mu.Lock()
+				if len(work) == 0 {
+					mu.Unlock()
+					return
+				}
+				dir := work[len(work)-1]
+				work = work[:len(work)-1]
+				mu.Unlock()
+
+				entries, err := os.ReadDir(dir)
+				if err != nil {
+					continue
+				}
+				for _, e := range entries {
+					if !e.IsDir() {
+						continue
+					}
+					name := e.Name()
+					if strings.HasPrefix(name, ".") && name != "." {
+						if name == ".git" {
+							continue
+						}
+					}
+					path := filepath.Join(dir, name)
+					info, _ := e.Info()
+					out <- scanJob{root: path, info: info}
+
+					mu.Lock()
+					work = append(work, path)
+					mu.Unlock()
+				}
+			}
+		}
+
+		// start workers
+		wg.Add(maxWorkers)
+		for i := 0; i < maxWorkers; i++ {
+			go worker()
+		}
+		wg.Wait()
+	}()
+	return out
+}
+
 // Commands
 func scanForCleanableItems(dir string, useGitignore bool) tea.Cmd {
 	return func() tea.Msg {
 		var items []CleanableItem
+		mx := sync.Mutex{}
 
 		if useGitignore {
-			// Scan .gitignore file for patterns
 			gitignoreItems := scanGitignoreItems(dir)
 			items = append(items, gitignoreItems...)
-		} else {
-			// Define patterns to look for
-			patterns := map[string]string{
-				"node_modules":        "Node.js dependencies",
-				"target":              "Rust build artifacts",
-				"build":               "Build artifacts",
-				"dist":                "Distribution files",
-				"__pycache__":         "Python cache",
-				".pytest_cache":       "Pytest cache",
-				"venv":                "Python virtual environment",
-				"env":                 "Python virtual environment",
-				".venv":               "Python virtual environment",
-				"vendor":              "Vendor dependencies",
-				"deps":                "Elixir dependencies",
-				"_build":              "Elixir build artifacts",
-				".gradle":             "Gradle cache",
-				"cmake-build-debug":   "CMake build artifacts",
-				"cmake-build-release": "CMake build artifacts",
-				"DerivedData":         "Xcode derived data",
-				"*.log":               "Log files",
-				"*.tmp":               "Temporary files",
-			}
-
-			// Walk through directory tree
-			err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-				if err != nil {
-					return nil // Skip errors, continue walking
-				}
-
-				// Skip hidden directories and files at root level
-				if strings.HasPrefix(filepath.Base(path), ".") && path != dir {
-					if info.IsDir() {
-						return filepath.SkipDir
-					}
-					return nil
-				}
-
-				// Check if this matches any of our patterns
-				basename := filepath.Base(path)
-				for pattern, description := range patterns {
-					if strings.Contains(pattern, "*") {
-						// Handle glob patterns
-						if matched, _ := filepath.Match(pattern, basename); matched {
-							size := getDirectorySize(path)
-							items = append(items, CleanableItem{
-								Path:     path,
-								Type:     description,
-								Size:     size,
-								Info:     description,
-								Selected: false,
-							})
-						}
-					} else if basename == pattern {
-						size := getDirectorySize(path)
-						items = append(items, CleanableItem{
-							Path:     path,
-							Type:     description,
-							Size:     size,
-							Info:     description,
-							Selected: false,
-						})
-
-						// If it's a directory, skip walking into it
-						if info.IsDir() {
-							return filepath.SkipDir
-						}
-					}
-				}
-
-				return nil
-			})
-
-			if err != nil {
-				return scanCompleteMsg([]CleanableItem{})
-			}
+			return scanCompleteMsg(items)
 		}
 
+		patterns := map[string]string{
+			"node_modules":        "Node.js dependencies",
+			"target":              "Rust build artifacts",
+			"build":               "Build artifacts",
+			"dist":                "Distribution files",
+			"__pycache__":         "Python cache",
+			".pytest_cache":       "Pytest cache",
+			"venv":                "Python virtual environment",
+			"env":                 "Python virtual environment",
+			".venv":               "Python virtual environment",
+			"vendor":              "Vendor dependencies",
+			"deps":                "Elixir dependencies",
+			"_build":              "Elixir build artifacts",
+			".gradle":             "Gradle cache",
+			"cmake-build-debug":   "CMake build artifacts",
+			"cmake-build-release": "CMake build artifacts",
+			"DerivedData":         "Xcode derived data",
+			"*.log":               "Log files",
+			"*.tmp":               "Temporary files",
+		}
+
+		sizeCache := make(map[string]int64)
+		var cacheMu sync.Mutex
+		var wg sync.WaitGroup
+
+		for j := range boundedWalk(dir, runtime.NumCPU()) {
+			j := j
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				name := filepath.Base(j.root)
+				for pat, desc := range patterns {
+					var match bool
+					if strings.Contains(pat, "*") {
+						match, _ = filepath.Match(pat, name)
+					} else {
+						match = name == pat
+					}
+					if match {
+						cacheMu.Lock()
+						if _, ok := sizeCache[j.root]; !ok {
+							sizeCache[j.root] = getDirectorySize(j.root)
+						}
+						sz := sizeCache[j.root]
+						cacheMu.Unlock()
+
+						mx.Lock()
+						items = append(items, CleanableItem{
+							Path:     j.root,
+							Type:     desc,
+							Size:     sz,
+							Info:     desc,
+							Selected: false,
+						})
+						mx.Unlock()
+						return
+					}
+				}
+			}()
+		}
+		wg.Wait()
 		return scanCompleteMsg(items)
 	}
 }
@@ -529,99 +579,74 @@ type cleanSingleItem struct {
 }
 
 func scanGitignoreItems(dir string) []CleanableItem {
-	var items []CleanableItem
 	gitignorePath := filepath.Join(dir, ".gitignore")
-
-	// Check if .gitignore exists
 	if _, err := os.Stat(gitignorePath); os.IsNotExist(err) {
-		return items
+		return nil
 	}
 
-	// Read .gitignore file
 	file, err := os.Open(gitignorePath)
 	if err != nil {
-		return items
+		return nil
 	}
 	defer file.Close()
 
+	// Read all non-comment patterns once
+	var patterns []string
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-
-		// Skip empty lines and comments
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-
-		// Skip negation patterns for now
-		if strings.HasPrefix(line, "!") {
-			continue
-		}
-
-		// Walk through directory to find matches
-		err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-			if err != nil {
-				return nil
-			}
-
-			// Skip the .git directory itself
-			if strings.Contains(path, "/.git/") || strings.HasSuffix(path, "/.git") {
-				return filepath.SkipDir
-			}
-
-			// Get relative path from directory
-			relPath, err := filepath.Rel(dir, path)
-			if err != nil {
-				return nil
-			}
-
-			if matchesGitignorePattern(line, relPath) {
-				for _, existing := range items {
-					if existing.Path == path {
-						return nil
-					}
-				}
-
-				size := getDirectorySize(path)
-				items = append(items, CleanableItem{
-					Path:     path,
-					Type:     "Gitignore pattern: " + line,
-					Size:     size,
-					Info:     "Matches .gitignore pattern",
-					Selected: false,
-				})
-
-				// If it's a directory, skip walking into it
-				if info.IsDir() {
-					return filepath.SkipDir
-				}
-			}
-
-			return nil
-		})
-
-		if err != nil {
-			continue
+		if line != "" && !strings.HasPrefix(line, "#") && !strings.HasPrefix(line, "!") {
+			patterns = append(patterns, line)
 		}
 	}
 
+	var (
+		items []CleanableItem
+		mu    sync.Mutex
+	)
+
+	for job := range boundedWalk(dir, runtime.NumCPU()) {
+		path := job.root
+		rel, _ := filepath.Rel(dir, path)
+		for _, pat := range patterns {
+			if matchesGitignorePattern(pat, rel) {
+				mu.Lock()
+				// de-dup
+				found := false
+				for _, it := range items {
+					if it.Path == path {
+						found = true
+						break
+					}
+				}
+				if !found {
+					items = append(items, CleanableItem{
+						Path:     path,
+						Type:     "Gitignore pattern: " + pat,
+						Size:     getDirectorySize(path),
+						Info:     "Matches .gitignore pattern",
+						Selected: false,
+					})
+				}
+				mu.Unlock()
+				break // one match is enough
+			}
+		}
+	}
 	return items
 }
 
 func matchesGitignorePattern(pattern, path string) bool {
-	// Handle directory patterns
 	if strings.HasSuffix(pattern, "/") {
 		pattern = strings.TrimSuffix(pattern, "/")
 		return strings.HasPrefix(path, pattern+"/") || path == pattern
 	}
 
-	// Handle glob patterns
 	if strings.Contains(pattern, "*") {
 		matched, _ := filepath.Match(pattern, filepath.Base(path))
 		if matched {
 			return true
 		}
-		// Also try matching the full relative path
 		matched, _ = filepath.Match(pattern, path)
 		return matched
 	}
@@ -630,24 +655,27 @@ func matchesGitignorePattern(pattern, path string) bool {
 	return path == pattern || strings.Contains(path, pattern) || strings.HasSuffix(path, "/"+pattern)
 }
 
-// Helper functions
 func getDirectorySize(path string) int64 {
 	var size int64
+	var wg sync.WaitGroup
+	limit := make(chan struct{}, runtime.NumCPU())
 
-	err := filepath.Walk(path, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
+	filepath.WalkDir(path, func(p string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
 			return nil
 		}
-		if !info.IsDir() {
-			size += info.Size()
-		}
+		limit <- struct{}{}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-limit }()
+			if fi, err := d.Info(); err == nil {
+				atomic.AddInt64(&size, fi.Size())
+			}
+		}()
 		return nil
 	})
-
-	if err != nil {
-		return 0
-	}
-
+	wg.Wait()
 	return size
 }
 
@@ -709,43 +737,36 @@ func main() {
 	var version2Flag = flag.Bool("version", false, "show version")
 	flag.Parse()
 
-	// Handle help flag
 	if *helpFlag || *help2Flag {
 		showHelp()
 		return
 	}
 
-	// Handle version flag
 	if *versionFlag || *version2Flag {
 		showVersion()
 		return
 	}
 
-	// Get target directory from remaining args or use current directory
 	targetDir := "."
 	args := flag.Args()
 	if len(args) > 0 {
 		targetDir = args[0]
 
-		// Verify the directory exists
 		if info, err := os.Stat(targetDir); err != nil {
 			log.Fatalf("Error: Directory '%s' does not exist or is not accessible", targetDir)
 		} else if !info.IsDir() {
 			log.Fatalf("Error: '%s' is not a directory", targetDir)
 		}
 
-		// Convert to absolute path
 		if absPath, err := filepath.Abs(targetDir); err == nil {
 			targetDir = absPath
 		}
 	} else {
-		// Get current directory
 		if currentDir, err := os.Getwd(); err == nil {
 			targetDir = currentDir
 		}
 	}
 
-	// Check if gitignore flag is used but .gitignore doesn't exist
 	if *gitignoreFlag {
 		gitignorePath := filepath.Join(targetDir, ".gitignore")
 		if _, err := os.Stat(gitignorePath); os.IsNotExist(err) {
