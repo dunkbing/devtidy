@@ -62,23 +62,34 @@ type cleanProgressMsg struct {
 	done  int
 	total int
 }
+type sizeUpdateMsg struct {
+	path string
+	size int64
+}
+type allSizesCompleteMsg struct {
+	items []CleanableItem
+}
 
 // Model represents the application state
 type Model struct {
-	state         state
-	list          list.Model
-	items         []CleanableItem
-	spinner       spinner.Model
-	progress      progress.Model
-	cleaning      bool
-	totalSize     int64
-	cleanedSize   int64
-	currentDir    string
-	useGitignore  bool
-	scanStartTime time.Time
-	scanDuration  time.Duration
-	scannedItems  int
-	err           error
+	state             state
+	list              list.Model
+	items             []CleanableItem
+	spinner           spinner.Model
+	progress          progress.Model
+	cleaning          bool
+	totalSize         int64
+	cleanedSize       int64
+	currentDir        string
+	useGitignore      bool
+	scanStartTime     time.Time
+	scanDuration      time.Duration
+	scannedItems      int
+	err               error
+	calculatingSizes  bool
+	pendingSizes      map[string]int64
+	totalSizeJobs     int
+	completedSizeJobs int
 }
 
 // Key mappings
@@ -142,15 +153,19 @@ func initialModel(targetDir string, useGitignore bool) Model {
 	l.Styles.Title = titleStyle
 
 	return Model{
-		state:         stateScanning,
-		list:          l,
-		items:         []CleanableItem{},
-		spinner:       s,
-		progress:      prog,
-		currentDir:    targetDir,
-		useGitignore:  useGitignore,
-		scanStartTime: time.Now(),
-		scannedItems:  0,
+		state:             stateScanning,
+		list:              l,
+		items:             []CleanableItem{},
+		spinner:           s,
+		progress:          prog,
+		currentDir:        targetDir,
+		useGitignore:      useGitignore,
+		scanStartTime:     time.Now(),
+		scannedItems:      0,
+		calculatingSizes:  false,
+		pendingSizes:      make(map[string]int64),
+		totalSizeJobs:     0,
+		completedSizeJobs: 0,
 	}
 }
 
@@ -201,16 +216,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.items = []CleanableItem(msg)
 		m.scannedItems = len(m.items)
 		m.scanDuration = time.Since(m.scanStartTime)
-		m.state = stateSelecting
 
-		// Convert items to list items
-		listItems := make([]list.Item, len(m.items))
-		for i, item := range m.items {
-			listItems[i] = item
+		// Start calculating sizes for all items
+		m.calculatingSizes = true
+		m.totalSizeJobs = 0
+		m.completedSizeJobs = 0
+		for _, item := range m.items {
+			if item.Size == 0 {
+				m.totalSizeJobs++
+			}
 		}
 
-		m.list.SetItems(listItems)
-		return m, nil
+		if m.totalSizeJobs == 0 {
+			// No sizes to calculate, go straight to selecting
+			m.state = stateSelecting
+			listItems := make([]list.Item, len(m.items))
+			for i, item := range m.items {
+				listItems[i] = item
+			}
+			m.list.SetItems(listItems)
+			return m, nil
+		}
+
+		return m, calculateSizesAsyncBatch(m.items)
 
 	case cleanProgressMsg:
 		cmd := m.progress.SetPercent(float64(msg.done) / float64(msg.total))
@@ -274,8 +302,39 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.scannedItems = len(m.items) // Update total items count
 		return m, nil
 
+	case sizeUpdateMsg:
+		if m.calculatingSizes {
+			// Store the size update
+			m.pendingSizes[msg.path] = msg.size
+			m.completedSizeJobs++
+
+			// Check if all sizes are calculated
+			if m.completedSizeJobs >= m.totalSizeJobs {
+				// Apply all size updates
+				for i, item := range m.items {
+					if size, exists := m.pendingSizes[item.Path]; exists {
+						m.items[i].Size = size
+					}
+				}
+
+				sort.Slice(m.items, func(i, j int) bool {
+					return m.items[i].Size > m.items[j].Size
+				})
+
+				// show final sorted list
+				m.state = stateSelecting
+				m.calculatingSizes = false
+				listItems := make([]list.Item, len(m.items))
+				for j, modelItem := range m.items {
+					listItems[j] = modelItem
+				}
+				m.list.SetItems(listItems)
+			}
+		}
+		return m, nil
+
 	case spinner.TickMsg:
-		if m.state == stateScanning {
+		if m.state == stateScanning || m.calculatingSizes {
 			var cmd tea.Cmd
 			m.spinner, cmd = m.spinner.Update(msg)
 			return m, cmd
@@ -296,6 +355,17 @@ func (m Model) View() string {
 	switch m.state {
 	case stateScanning:
 		elapsed := time.Since(m.scanStartTime)
+		if m.calculatingSizes {
+			return docStyle.Render(fmt.Sprintf(
+				"%s Calculating sizes...\n\nDirectory: %s\nScan time: %v\nItems found: %d\nSizes calculated: %d/%d",
+				m.spinner.View(),
+				m.currentDir,
+				m.scanDuration.Round(time.Millisecond),
+				m.scannedItems,
+				m.completedSizeJobs,
+				m.totalSizeJobs,
+			))
+		}
 		return docStyle.Render(fmt.Sprintf(
 			"%s Scanning for cleanable items...\n\nDirectory: %s\nElapsed: %v\nItems found: %d",
 			m.spinner.View(),
@@ -493,16 +563,11 @@ func scanForCleanableItems(dir string, useGitignore bool) tea.Cmd {
 		mx := sync.Mutex{}
 
 		if useGitignore {
-			gitignoreItems := scanGitignoreItems(dir)
+			gitignoreItems := scanGitignoreItemsAsync(dir)
 			items = append(items, gitignoreItems...)
-			sort.Slice(items, func(i, j int) bool {
-				return items[i].Size > items[j].Size
-			})
 			return scanCompleteMsg(items)
 		}
 
-		sizeCache := make(map[string]int64)
-		var cacheMu sync.Mutex
 		var wg sync.WaitGroup
 
 		maxWorkers := runtime.NumCPU() / 2
@@ -526,18 +591,11 @@ func scanForCleanableItems(dir string, useGitignore bool) tea.Cmd {
 							match = name == pat
 						}
 						if match {
-							cacheMu.Lock()
-							if _, ok := sizeCache[j.root]; !ok {
-								sizeCache[j.root] = getDirectorySize(j.root)
-							}
-							sz := sizeCache[j.root]
-							cacheMu.Unlock()
-
 							mx.Lock()
 							items = append(items, CleanableItem{
 								Path:     j.root,
 								Type:     desc,
-								Size:     sz,
+								Size:     0,
 								Info:     desc,
 								Selected: false,
 							})
@@ -557,9 +615,6 @@ func scanForCleanableItems(dir string, useGitignore bool) tea.Cmd {
 		}()
 
 		wg.Wait()
-		sort.Slice(items, func(i, j int) bool {
-			return items[i].Size > items[j].Size
-		})
 		return scanCompleteMsg(items)
 	}
 }
@@ -609,7 +664,6 @@ func scanGitignoreItems(dir string) []CleanableItem {
 	}
 	defer file.Close()
 
-	// Read all non-comment patterns once
 	var patterns []string
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
@@ -648,13 +702,70 @@ func scanGitignoreItems(dir string) []CleanableItem {
 					})
 				}
 				mu.Unlock()
-				break // one match is enough
+				break
 			}
 		}
 	}
 	sort.Slice(items, func(i, j int) bool {
 		return items[i].Size > items[j].Size
 	})
+	return items
+}
+
+func scanGitignoreItemsAsync(dir string) []CleanableItem {
+	gitignorePath := filepath.Join(dir, ".gitignore")
+	if _, err := os.Stat(gitignorePath); os.IsNotExist(err) {
+		return nil
+	}
+
+	file, err := os.Open(gitignorePath)
+	if err != nil {
+		return nil
+	}
+	defer file.Close()
+
+	var patterns []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line != "" && !strings.HasPrefix(line, "#") && !strings.HasPrefix(line, "!") {
+			patterns = append(patterns, line)
+		}
+	}
+
+	var (
+		items []CleanableItem
+		mu    sync.Mutex
+	)
+
+	for job := range boundedWalk(dir, runtime.NumCPU()/2) {
+		path := job.root
+		rel, _ := filepath.Rel(dir, path)
+		for _, pat := range patterns {
+			if matchesGitignorePattern(pat, rel) {
+				mu.Lock()
+				// de-dup
+				found := false
+				for _, it := range items {
+					if it.Path == path {
+						found = true
+						break
+					}
+				}
+				if !found {
+					items = append(items, CleanableItem{
+						Path:     path,
+						Type:     "Gitignore pattern: " + pat,
+						Size:     0,
+						Info:     "Matches .gitignore pattern",
+						Selected: false,
+					})
+				}
+				mu.Unlock()
+				break
+			}
+		}
+	}
 	return items
 }
 
@@ -679,16 +790,80 @@ func matchesGitignorePattern(pattern, path string) bool {
 
 func getDirectorySize(path string) int64 {
 	var size int64
-    filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
-        if err != nil {
-            return err
-        }
-        if !info.IsDir() {
-            size += info.Size()
-        }
-        return err
-    })
-    return size
+	filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			size += info.Size()
+		}
+		return err
+	})
+	return size
+}
+
+func getDirectorySizeFast(path string) int64 {
+	var size int64
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return 0
+	}
+
+	var wg sync.WaitGroup
+	sizeChan := make(chan int64, len(entries))
+
+	maxWorkers := 4
+	semaphore := make(chan struct{}, maxWorkers)
+
+	for _, entry := range entries {
+		wg.Add(1)
+		go func(e os.DirEntry) {
+			defer wg.Done()
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+
+			entryPath := filepath.Join(path, e.Name())
+			if e.IsDir() {
+				sizeChan <- getDirectorySize(entryPath)
+			} else {
+				if info, err := e.Info(); err == nil {
+					sizeChan <- info.Size()
+				} else {
+					sizeChan <- 0
+				}
+			}
+		}(entry)
+	}
+
+	go func() {
+		wg.Wait()
+		close(sizeChan)
+	}()
+
+	for s := range sizeChan {
+		size += s
+	}
+
+	return size
+}
+
+func calculateSizesAsyncBatch(items []CleanableItem) tea.Cmd {
+	var commands []tea.Cmd
+
+	for _, item := range items {
+		if item.Size == 0 {
+			commands = append(commands, calculateSingleSize(item.Path))
+		}
+	}
+
+	return tea.Batch(commands...)
+}
+
+func calculateSingleSize(path string) tea.Cmd {
+	return func() tea.Msg {
+		size := getDirectorySizeFast(path)
+		return sizeUpdateMsg{path: path, size: size}
+	}
 }
 
 func formatSize(bytes int64) string {
@@ -704,7 +879,7 @@ func formatSize(bytes int64) string {
 	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
 
-const version = "v1.0.4"
+const version = "v1.0.5"
 
 var cleanablePatterns = map[string]string{
 	"node_modules":        "Node.js dependencies",
