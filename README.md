@@ -2,6 +2,9 @@
 
 A terminal UI app to clean up development dependencies and build artifacts.
 
+### Demo
+![demo](./demo.gif)
+
 ## What it cleans
 
 ### Default mode
